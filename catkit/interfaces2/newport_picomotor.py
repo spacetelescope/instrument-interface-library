@@ -41,13 +41,17 @@ def http_except(function):
 class NewportPicomotor:
     """ This class handles all the picomotor stufff. """
 
-    def __init__(self, ip=None, max_step=None, timeout=None, home_reset=True):
+    def __init__(self, motor_count, controller_count, ip=None, max_step=None, timeout=None, home_reset=True):
         """ Initial function to set up logging and 
         set the IP address for the controller. Anything set to None will attempt to
         pull from the config file.
         
         Parameters
         ----------
+        motor_count : int
+            Number of connected motors.
+        controller_count : int
+            Number of daisy chained controllers.
         ip : string
             The IP address for the controller. Defaults to None.
         max_step : float
@@ -58,6 +62,10 @@ class NewportPicomotor:
             Whether or not to reset to the home position on controller close.
             Defaults to True.
         """
+        
+        # Build a list of motors and controllers. 
+        self.motors = [n for n in range(1, motor_count+1)]
+        self.controllers = [None] + [n for n in range(2, controller_count+1)]
 
         # Set IP address
         if None in [ip, max_step, timeout]:
@@ -67,7 +75,7 @@ class NewportPicomotor:
             
             config = configparser.ConfigParser()
             config.read(config_path)
-            
+        
         self.ip = config.get('newport_picomotor_8743-CL_8745-PS', 'ip') if ip is None else ip
         self.max_step = config.get('newport_picomotor_8743-CL_8745-PS', 'max_step') if max_step is None else max_step
         self.timeout = config.get('newport_picomotor_8743-CL_8745-PS', 'timeout') if timeout is None else timeout
@@ -105,9 +113,10 @@ class NewportPicomotor:
         self.logger.info('IP address : {}, is online, and logging instantiated.'.format(self.ip))
         
         # Save current position as home.
-        for axis in '1234':
-            self.command('home_position', int(axis), 0)
-            self.logger.info('Current position saved as home.')
+        for daisy in self.controllers:
+            for axis in self.motors:
+                self.command('home_position', int(axis), 0, daisy_key=daisy)
+                self.logger.info('Current position saved as home.')
 
 
     def __enter__(self):
@@ -136,11 +145,11 @@ class NewportPicomotor:
 
     def reset_controller(self):
         """Function to reset the motors to where they started (or were last reset.)"""
-        
-        for axis in '1234':
-            self.command('exact_move', int(axis), 0)
-            self.command('home_position', int(axis), 0)
-            self.logger.info('Controller reset.')
+        for daisy_key in self.controllers: 
+            for axis in self.motors:
+                self.command('exact_move', int(axis), 0, daisy_key=daisy_key)
+                self.command('home_position', int(axis), 0, daisy_key=daisy_key)
+                self.logger.info('Controller reset.')
         
     def close_logger(self):
         """Function for the close logger behavior."""
@@ -151,7 +160,7 @@ class NewportPicomotor:
             self.logger.removeHandler(handler)
 
     @http_except
-    def command(self, cmd_key, axis, value):
+    def command(self, cmd_key, axis, value, daisy_key=None):
         """ Function to send a command to the controller.
 
         Parameters
@@ -163,10 +172,14 @@ class NewportPicomotor:
             Axis 1, 2, 3, 4.
         value : int
             Given an int, it will set the command to that value.
+        daisy_key : int
+            If the controller is daisy chained, where in the hierarchy we are. 
+            If commands only to the master controller, no prefix is needed,
+            defaults to None.
         """
         
-        set_message = self._build_message(cmd_key, 'set', axis, value)
-        get_message = self._build_message(cmd_key, 'get', axis)
+        set_message = self._build_message(daisy_key, cmd_key, 'set', axis, value)
+        get_message = self._build_message(daisy_key, cmd_key, 'get', axis)
         
         initial_value = self._send_message(get_message, 'get') if cmd_key == 'relative_move' else 0
         
@@ -176,7 +189,7 @@ class NewportPicomotor:
         if float(set_value) != value:
             self.logger.error('Something is wrong, {} != {}'.format(set_value, value)) 
          
-        self.logger.info('Command sent. Action : {}. Axis : {}. Value : {}'.format(cmd_key, axis, value))
+        self.logger.info('Command sent. Action : {}. Axis : {}. Value : {}. Controller : {}.'.format(cmd_key, axis, value, daisy_key))
     
     def convert_move_to_pixel(self, img_before, img_after, move, axis):
         """ After two images taken some x_move or y_move apart, calculate how
@@ -231,7 +244,7 @@ class NewportPicomotor:
         return r, theta, r_ratio, delta_theta
     
     @http_except
-    def get_status(self, axis):
+    def get_status(self, axis, daisy_key=None):
         """Checks the status of the relative/absolute positions and home 
         positions for the given axis.
         
@@ -239,7 +252,9 @@ class NewportPicomotor:
         ----------
         axis : int
             The axis to check.
-        
+        daisy_key : int
+            Where in the hierarchy the command falls. Defaults to None for
+            master controller. 
         Returns
         -------
         state_dict : dictionary
@@ -249,22 +264,23 @@ class NewportPicomotor:
         state_dict = {}
         for cmd_key in ('home_position', 'relative_move'):
             
-            message = self._build_message(cmd_key, 'get', axis)
+            message = self._build_message(daisy_key, cmd_key, 'get', axis)
             value = self._send_message(message, 'get') 
             state_dict['{}_{}'.format(cmd_key, axis)] = value
-            self.logger.info('For axis {}, {} is set to {}'.format(axis, cmd_key, value))
+            daisy_insert = '' if daisy_key is None else 'for chain {}'.format(daisy_key)
+            self.logger.info('For axis {}, {} is set to {}'.format(axis, daisy_insert, cmd_key, value))
         
         return state_dict
         
     @http_except
-    def reset(self):
+    def reset(self, daisy_key=None):
         """Resets the controller."""
         
-        message = self._build_message('reset', 'reset')
+        message = self._build_message('reset', 'reset', daisy_key=daisy_key)
         self._send_message(message, 'set')
         self.logger.info('Controller reset.')
 
-    def _build_message(self, cmd_key, cmd_type, axis=None, value=None):
+    def _build_message(self, cmd_key, cmd_type, daisy_key=None, axis=None, value=None):
         """Build a message for the newport picomotor controller.
 
         Parameters
@@ -275,6 +291,8 @@ class NewportPicomotor:
             The kind of command, whether to get, set, or reset.
         axis : int, optional
             The axis (1-4 are valid) to set. Defaults to None.
+        daisy_key : int, None
+            Which controller in the master/slave hierarchy.
         value : str 
         
         Returns
@@ -282,8 +300,12 @@ class NewportPicomotor:
         message : str
             The message to send to the controller site.
         """
-        
-        address = self.cmd_dict[cmd_key]
+        if daisy_key is None or isinstance(daisy_key, int):
+            daisy_prefix = "{}>".format(daisy_key) if daisy_key else ""
+        else:
+            raise TypeError("The 'daisy_key' requires an integer or None input.")
+
+        address = daisy_prefix + self.cmd_dict[cmd_key]
 
         if cmd_key == 'reset':
             if axis is not None:
