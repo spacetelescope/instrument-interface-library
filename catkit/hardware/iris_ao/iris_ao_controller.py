@@ -1,43 +1,73 @@
 """Interface for IrisAO segmented deformable mirror controller."""
 
+import ctypes
 import os
-import signal
-import subprocess
-import time
 
 from catkit.interfaces.DeformableMirrorController import DeformableMirrorController
 from catkit.hardware.iris_ao.segmented_dm_command import SegmentedDmCommand
-
 from catkit.hardware.iris_ao import util
+import catkit.util
+
+
+class IrisAOCLib:
+    def __init__(self, dll_filepath):
+        self.dll_filepath = dll_filepath
+        self.dll = None
+
+        if not self.dll:
+            try:
+                self.dll = ctypes.cdll.LoadLibrary(self.dll_filepath)
+            except Exception as error:
+                raise ImportError(f"Failed to load library '{self.dll_filepath}'.") from error
+
+        # Declare prototypes.
+        # void MirrorCommand (void* mirror, void* command);
+        self._MirrorCommand = self.dll.MirrorCommand
+        self._MirrorCommand.restype = None
+        self._MirrorCommand.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        # void* MirrorConnect (char* mirror_serial, char* driver_serial, bool disabled);
+        self._MirrorConnect = self.dll.MirrorConnect
+        self._MirrorConnect.restype = ctypes.c_void_p
+        self._MirrorConnect.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_bool]
+
+        # void* MirrorRelease (void* mirror);
+        self._MirrorRelease = self.dll.MirrorRelease
+        self._MirrorRelease.restype = ctypes.c_void_p
+        self._MirrorRelease.argtypes = [ctypes.c_void_p]
+
+        # void SetMirrorPosition (void* mirror, unsigned int segment, float z, float xgrad, float ygrad);
+        self._SetMirrorPosition = self.dll.SetMirrorPosition
+        self._SetMirrorPosition.restype = None
+        self._SetMirrorPosition.argtypes = [ctypes.c_char_p, ctypes.c_uint, ctypes.c_float, ctypes.c_float, ctypes.c_float]
+
+    def MirrorCommand(self, mirror, command=None):
+        if command is None:
+            command = self.instrument_lib.MirrorSendSettings
+        return self._MirrorConnect(mirror, command)
+
+    def MirrorConnect(self, mirror_serial, driver_serial, disabled):
+        return self._MirrorConnect(mirror_serial, driver_serial, disabled)
+
+    def MirrorRelease(self, mirror):
+        return self._MirrorRelease(mirror)
+
+    def SetMirrorPosition(self, mirror, segment, z, xgrad, ygrad):
+        return self._SetMirrorPosition(mirror, segment, z, xgrad, ygrad)
 
 
 class IrisAoDmController(DeformableMirrorController):
-    """
-    The low-level IrisAO API is written in C, and this class bridges to the compiled executable 'DM_Control.exe' stored
-    locally on the machine that controls the IrisAO mirror. The basic functionality is that the user creates a command
-    and stores it to an ini file called 'ConfigPTT.ini'. The executable then grabs that ini file and applies the piston,
-    tip, tilt (PTT) values in that file to the hardware.
+    """ Device class to control the IrisAO DM. """
 
-    The executable 'DM_Control.exe' is controlled by passing strings to it with stdin. E.g.:
-
-    dm.stdin.write('config\n')
-    dm.stdin.flush()
-
-    will load the PTT values in the file specified with the variable filename_ptt_dm.
-
-    Further details can be found in the linked PDF in this comment on GitHub:
-    https://github.com/spacetelescope/catkit/pull/71#discussion_r466536405
-    """
-
-    instrument_lib = subprocess
+    instrument_lib = IrisAOCLib
 
     def initialize(self,
                    mirror_serial,
                    driver_serial,
-                   disable_hardware,
-                   path_to_dm_exe,
-                   filename_ptt_dm,
-                   path_to_custom_mirror_files=None):
+                   mcf_filepath,
+                   dcf_filepath,
+                   dll_filepath,
+                   disable_hardware=False):
         """
         Initialize dm manufacturer specific object - this does not, nor should it, open a
         connection.
@@ -45,65 +75,95 @@ class IrisAoDmController(DeformableMirrorController):
         :param mirror_serial: string, The mirror serial number. This corresponds to a .mcf file that MUST include the
                               driver serial number under "Smart Driver". See README.
         :param driver_serial: string, The driver serial number. This corresponds to a .dcf file. See README.
-        :param disable_hardware: bool, If False, will run on hardware (always used on JOST this way). If True,
-                                 probably (!) just runs the GUI? We never used it with True, so not sure.
-        :param path_to_dm_exe: string, The path to the local directory that houses the DM_Control.exe file.
-        :param filename_ptt_dm: string, Full path including filename of the ini file that provides the PTT values to be
-                                loaded onto the hardware, e.g. ".../ConfigPTT.ini".
-        :param path_to_custom_mirror_files: string, Full path to mirror .ini files.
+        :param mcf_filepath: string, Full path to .mcf file.
+        :param dcf_filepath: string, Full path to .dcf file.
+        :param dll_filepath: string, Full path to IrisAO.Devices.dll (x64).
+        :param disable_hardware: bool, False := use hardware, True := all hardware APIs are NOOPs.
         """
 
-        self.log.info("Opening IrisAO connection")
-        # Create class attributes for storing an individual command.
-        self.command_object = None
+        self.dll_filepath = dll_filepath
+        self.instrument_lib = self.instrument_lib(self.dll_filepath)
 
+        self.command_object = None
         self.mirror_serial = mirror_serial
         self.driver_serial = driver_serial
-
-        # For the suprocess call
         self.disable_hardware = disable_hardware
-        self.path_to_dm_exe = path_to_dm_exe
-        self.full_path_dm_exe = os.path.join(path_to_dm_exe, 'DM_Control.exe')
-        self.path_to_custom_mirror_files = path_to_custom_mirror_files
+        self.mcf_filepath = mcf_filepath
+        self.dcf_filepath = dcf_filepath
 
-        # Where to write ConfigPTT.ini file that gets read by the C++ code
-        self.filename_ptt_dm = filename_ptt_dm
+        # Check config files exist.
+        self.validate_config_files()
 
-    def send_data(self, data):
+        # The IrisAO driver expects the .dcf and .mcf config files in the working dir.
+        # Neither adding them to PATH nor PYTHONPATH worked.
+        # This is a workaround.
+        # These files remain copied until their refs go out of scope, i.e., when this class instance drops out of scope.
+        cwd = os.path.abspath(os.getcwd())
+        self._mirror_config_file_copy = catkit.util.TempFileCopy(self.mcf_filepath, cwd)
+        self._driver_config_file_copy = catkit.util.TempFileCopy(self.dcf_filepath, cwd)
+
+    @staticmethod
+    def search_file(filepath, search_str, raise_exception=True):
+        with open(filepath, 'r') as open_file:
+            valid = False
+            while True:
+                line = open_file.readline()
+                if not line:  # EOF
+                    break
+                if search_str in line:
+                    valid = True
+                    break
+        if raise_exception:
+            if not valid:
+                raise ValueError(f"Couldn't find '{search_str}' in '{filepath}'.")
+        return valid
+
+    def validate_config_files(self):
+        """ Check config files are correct for given serial numbers. """
+
+        # Check correct SN# are baked into filenames.
+        if self.mirror_serial not in self.mcf_filepath:
+            raise ValueError(f"The mirror SN# '{self.mirror_serial}' doesn't match that of the .mcf file '{self.mcf_filepath}'.")
+        if self.driver_serial not in self.dcf_filepath:
+            raise ValueError(f"The driver SN# '{self.driver_serial}' doesn't match that of the .dcf file '{self.dcf_filepath}'.")
+
+        # Check SN# are fields within the files themselves. Only works for driver SN#.
+        self.search_file(filepath=self.dcf_filepath, search_str=f"[SN:{self.driver_serial}]")
+        self.search_file(filepath=self.mcf_filepath, search_str=f"// Smart Driver: {self.driver_serial}")
+
+    def _send_data(self, data):
         """
-        To send data to the IrisAO, you must write to the ConfigPTT.ini file
-        to send the command
+        To send data to the IrisAO.
 
         :param data: dict, the command to be sent to the DM
         """
-        # Write to ConfigPTT.ini
-        self.log.info("Creating config file: %s", self.filename_ptt_dm)
-        util.write_ini(data, path=self.filename_ptt_dm, dm_config_id=self.config_id,
-                       mirror_serial=self.mirror_serial,
-                       driver_serial=self.driver_serial)
+        if not self.instrument:
+            raise Exception(f"{self.config_id}: Open connection required.")
 
-        # Apply the written .ini file to DM
-        self.instrument.stdin.write(b'config\n')
-        self.instrument.stdin.flush()
+        if not isinstance(data, dict):
+            raise TypeError(f"{self.config_id}: expected 'data' to be a dict and not '{type(data)}'.")
+
+        try:
+            for segment, ptt in data.items():
+                # Pass values to connection handle (but not to driver box).
+                self.instrument_lib.SetMirrorPosition(self.instrument, segment, ptt[0], ptt[1], ptt[2])
+            # Now send the data to driver box.
+            self.instrument_lib.MirrorCommand(self.instrument)
+        except Exception as error:
+            raise Exception(f"{self.config_id}: Failed to send command data to device.") from error
 
     def _open(self):
         """Open a connection to the IrisAO"""
-        cmd = [self.full_path_dm_exe, str(self.disable_hardware)]
-        if self.path_to_custom_mirror_files:
-            cmd.append(self.path_to_custom_mirror_files)
-        if self.filename_ptt_dm:
-            cmd.append(self.filename_ptt_dm)
-
-        self.instrument = self.instrument_lib.Popen(cmd,
-                                                    stdin=self.instrument_lib.PIPE, stdout=self.instrument_lib.PIPE,
-                                                    stderr=self.instrument_lib.PIPE,
-                                                    cwd=self.path_to_dm_exe,
-                                                    bufsize=1,
-                                                    creationflags=self.instrument_lib.CREATE_NEW_PROCESS_GROUP)
-        time.sleep(1)
+        try:
+            self.instrument = self.instrument_lib.MirrorConnect(self.mirror_serial.encode(),
+                                                                self.driver_serial.encode(),
+                                                                self.disable_hardware)
+        except Exception as error:
+            self.instrument = None  # Don't try closing
+            raise Exception(f"{self.config_id}: Failed to connect to device.") from error
 
         # Initialize the Iris to zeros.
-        self.zero()
+        self.instrument_lib.MirrorCommand(self.instrument, command=self.instrument_lib.MirrorInitSettings)
 
         return self.instrument
 
@@ -122,24 +182,7 @@ class IrisAoDmController(DeformableMirrorController):
 
     def _close(self):
         """Close connection safely."""
-        try:
-            self.log.info('Closing Iris AO.')
-            # Since sending "quit" kills the proc a race condition exits between it quiting and a close() as it may
-            # exit before close() is called and thus cause close() to raise. This can even be true for an explicit call
-            # to stdin.flush() if the write buffer auto flushes.
-            # The above can leave the device hanging and unreachable. The safest option is to send the following signal
-            # which is gracefully handled on the C++ side.
-
-            #self.instrument.send_signal(signal.CTRL_C_EVENT)
-
-            # However, the above no longer seems to work, see HICAT-948 & HICAT-947.
-            self.instrument.stdin.write(b'quit\n')
-            try:
-                self.instrument.stdin.flush()
-            except Exception:
-                pass
-        finally:
-            self.instrument = None
+        self.instrument_lib.MirrorRelease(self.instrument)
 
     def apply_shape(self, dm_shape, dm_num=1):
         """
@@ -153,11 +196,14 @@ class IrisAoDmController(DeformableMirrorController):
         if dm_num != 1:
             raise NotImplementedError("You can only control one Iris AO at a time")
 
+        if not isinstance(dm_shape, SegmentedDmCommand):
+            raise TypeError(f"{self.config_id}: expected 'dm_shape' to be of type `{SegmentedDmCommand.__qualname__}' and not '{type(dm_shape)}'.")
+
         # Use DmCommand class to format the single command correctly.
-        command = dm_shape.to_command()
+        command_dict = dm_shape.to_command()
 
         # Send array to DM.
-        self.send_data(command)
+        self._send_data(command_dict)
 
         # Update the dm_command class attribute.
         self.command_object = dm_shape
