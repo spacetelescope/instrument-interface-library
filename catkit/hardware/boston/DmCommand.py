@@ -7,13 +7,16 @@ import numpy as np
 
 from catkit.config import CONFIG_INI
 import catkit.util
-
+import hicat.experiments.modules.zernike
 
 m_per_volt_map1 = None  # for caching the conversion factor, to avoid reading from disk each time
 m_per_volt_map2 = None  # for caching the conversion factor, to avoid reading from disk each time
 
 
 class DmCommand(object):
+
+    valid_dm_nums = (1, 2)
+
     def __init__(self, data, dm_num, flat_map=False, bias=False, as_voltage_percentage=False,
                  as_volts=False, sin_specification=None):
         """
@@ -26,7 +29,8 @@ class DmCommand(object):
         :param dm_num: Valid values are 0, 1, 2.  Default is 0, which will automatically identify which dm to use.
                      You can specify 1 or 2 to ensure a certain DM is used, regardless of how the input data is padded.
         :param flat_map: If true, add flat map correction to the data before outputting commands
-        :param bias: If true, add bias to the data before outputting commands
+        :param bias: None|bool|int
+            The bias voltage to add to the data before outputting commands. If None|True values are pulled from config.
         :param as_voltage_percentage: Interpret the data as a voltage percentage instead of meters; Deprecated.
         :param as_volts: If true, interpret the data as volts instead of meters
         :param sin_specification: Add this sine to the data
@@ -53,15 +57,18 @@ class DmCommand(object):
         self.command_length = CONFIG_INI.getint('boston_kilo952', 'command_length')
         self.pupil_length = CONFIG_INI.getint('boston_kilo952', 'dm_length_actuators')
         self.max_volts = CONFIG_INI.getint('boston_kilo952', 'max_volts')
-        self.bias_volts_dm1 = CONFIG_INI.getint('boston_kilo952', 'bias_volts_dm1')
-        self.bias_volts_dm2 = CONFIG_INI.getint('boston_kilo952', 'bias_volts_dm2')
+
+        # Handle bias voltages.
+        if self.bias is True or self.bias is None:
+            self.bias_voltage = CONFIG_INI.getint('boston_kilo952', f'bias_volts_dm{dm_num}')
+        elif self.bias is False:
+            self.bias_voltage = 0
+        else:
+            self.bias_voltage = self.bias
 
         # Error handling for dm_num.
-        if not (dm_num == 1 or dm_num == 2):
-            raise ValueError("The parameter dm_num must be 1 or 2.")
-
-        if flat_map and bias:
-            raise ValueError("You can only apply flat_map or bias, not both.")
+        if dm_num not in self.valid_dm_nums:
+            raise ValueError(f"The parameter dm_num must be either {self.valid_dm_nums}.")
 
         # Transform data to be a 2D array (ex: 34 x 34 for boston_kilo952).
         # Already 2D, store as-is.
@@ -101,20 +108,14 @@ class DmCommand(object):
             if not self.as_volts:
                 dm_command = convert_m_to_volts(self.data, self.dm_num)
 
-            # Apply bias.
-            if self.bias:
-                dm_command += self.bias_volts_dm1 if self.dm_num == 1 else self.bias_volts_dm2
+            # Apply bias voltages (which may just be 0 if bias=False was passed in upon instantiation).
+            dm_command += self.bias_voltage
 
-            # OR apply Flat Map (which is itself biased).
-            elif self.flat_map:
-                if self.dm_num == 1:
-                    flat_map_file_name = CONFIG_INI.get("boston_kilo952", "flat_map_dm1")
-                    flat_map_volts = fits.open(os.path.join(self.calibration_data_path, flat_map_file_name))
-                    dm_command += flat_map_volts[0].data
-                else:
-                    flat_map_file_name = CONFIG_INI.get("boston_kilo952", "flat_map_dm2")
-                    flat_map_volts = fits.open(os.path.join(self.calibration_data_path, flat_map_file_name))
-                    dm_command += flat_map_volts[0].data
+            # Apply Flat Map (which is itself could be biased).
+            if self.flat_map:
+                flat_map_file_name = CONFIG_INI.get("boston_kilo952", f"flat_map_dm{self.dm_num}")
+                flat_map_volts = fits.open(os.path.join(self.calibration_data_path, flat_map_file_name))
+                dm_command += flat_map_volts[0].data
 
             # Convert between 0-1.
             dm_command /= self.max_volts
@@ -289,28 +290,92 @@ def convert_dm_image_to_command(dm_image, path_to_save=None):
     return dm_command
 
 
-def create_flatmap_from_dm_command(dm_command_path, output_path, file_name=None, dm_num=1):
+def create_flatmap_from_dm_command(dm_command_path, output_path=None, file_name=None, dm_num=1):
     """
-    Converts a dm_command_2d.fits to the format used for the flatmap, and outputs a new flatmap fits file.
+    Converts a dm_command_2d.fits to the format used for the flatmap, returns the flatmap and, optionally,
+    outputs a new flatmap fits file.
     :param dm_command_path: Full path to the dm_command_2d.fits file.
-    :param output_path: Path to output the new flatmap fits file. Default is hardware/boston/
+    :param output_path: Path to output the new flatmap fits file. If not specified map is not written to file.
     :param file_name: Filename for new flatmap fits file. Default is flatmap_<timestamp>.fits
-    :return: None
+    :param dm_num: Which DM is this for, defaults to 1.
+    :return: dm_command_data: The flat map data in volts.
     """
     dm_command_data = fits.getdata(dm_command_path)
 
     dm_string = "dm1" if dm_num == 1 else "dm2"
 
-    if file_name is None:
-        # Create a string representation of the current timestamp.
-        time_stamp = time.time()
-        date_time_string = datetime.datetime.fromtimestamp(time_stamp).strftime("%Y-%m-%dT%H-%M-%S")
-        file_name = "flat_map_volts_" + str(dm_string) + "_" + date_time_string + ".fits"
-
-    if output_path is None:
-        raise ValueError
-
     # Convert the dm command units to volts.
     max_volts = CONFIG_INI.getint("boston_kilo952", "max_volts")
     dm_command_data *= max_volts
-    catkit.util.write_fits(dm_command_data, output_path)
+
+    if output_path is not None:
+        if file_name is None:
+            # Create a string representation of the current timestamp.
+            time_stamp = time.time()
+            date_time_string = datetime.datetime.fromtimestamp(time_stamp).strftime("%Y-%m-%dT%H-%M-%S")
+            file_name = "flat_map_volts_" + str(dm_string) + "_" + date_time_string + ".fits"
+        catkit.util.write_fits(dm_command_data, os.path.join(output_path, file_name))
+
+    return dm_command_data
+
+
+def create_constant_flat_map(output_path=None, file_name=None, dm_num=1):
+    """
+    Creates a uniform flat map and returns it and optionally outputs a new flatmap fits file.
+    :param output_path: Path to output the new flatmap fits file.  If not specified file not output.
+    :param file_name: Filename for new flatmap fits file. Default is
+            flat_map_volts_dm_<1 or 2>_constant.fits
+    :param dm_num: Which DM is this for?  Defaults to 1.
+    :return: dm_command_data: The flat map data in volts.
+    """
+
+    bias_volts = CONFIG_INI.getint('boston_kilo952', f'bias_volts_dm{dm_num}')
+    mask = catkit.util.get_dm_mask()
+    dm_command_data = mask * bias_volts
+
+    if output_path is not None:
+        if file_name is None:
+            file_name = f"flat_map_volts_dm_{dm_num}_constant.fits"
+        catkit.util.write_fits(dm_command_data, os.path.join(output_path, file_name))
+
+    return dm_command_data
+
+
+def add_zernike_to_flat_map(output_path=None, file_name=None, dm_num=1, zernike_index=4, zernike_coeff_volts=10):
+    """
+    Creates a new flat map from the existing flat map for selected DM by adding a specified Zernike term with the
+    specified coefficient magnitude and returns it.  Optionally it can be output to a fits file.
+    :param output_path: Path to output the new flatmap fits file.  If not specified it it not output.
+    :param file_name: Filename for new flatmap fits file. Default is
+            flat_map_volts_dm_<1 or 2>_zernike_<zernike index>_<coefficient value>V.fits
+    :param dm_num: Which DM is this for?  Defaults to 1.
+    :param zernike_index: What Zernike term are we applying, defaults to 4, which  is focus.
+    :param zernike_coeff_volts: Coefficient of the Zernike term that we're adding in volts.  Defaults to +10, which for
+    :                           most Zernike terms should be a P2V of 20.
+    :return: flat_map_volts: The flat map data in volts.
+    """
+    # Get the current flat map
+    flat_map_volts = get_flat_map_volts(dm_num)
+
+    # Get the Zernike to perturb it with
+    zernike_values_volts = hicat.experiments.modules.zernike.create_zernike(zernike_index, zernike_coeff_volts)
+
+    # Make sure the Zernike values are all on the same side of zero so that we're only perturbing the flat map by an
+    # entirely positive or negative values.  No mixed signs.
+    coeff_sign = np.sign(zernike_coeff_volts)
+    extreme_value = np.min(coeff_sign * zernike_values_volts)
+    zernike_values_volts = coeff_sign * (coeff_sign * zernike_values_volts - extreme_value)
+
+    # Add in the perturbation
+    flat_map_volts += zernike_values_volts
+
+    mask = catkit.util.get_dm_mask().astype('bool')
+    flat_map_volts *= mask
+    flat_map_volts[flat_map_volts < 0] = 0  # Clip neg. values at 0.
+
+    if output_path is not None:
+        if file_name is None:
+            file_name = f"flat_map_volts_dm_{dm_num}_zernike_{zernike_index}_{zernike_coeff_volts:.2f}V.fits"
+        catkit.util.write_fits(flat_map_volts, os.path.join(output_path, file_name))
+
+    return flat_map_volts
